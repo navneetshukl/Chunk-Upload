@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 
 const uploadFileInChunks = async (file, uploadUrl, onProgress) => {
-  const chunkSize = 500; // 1MB
+  const chunkSize = 1024*1024; // 1MB
   const totalChunks = Math.ceil(file.size / chunkSize);
 
   for (let i = 0; i < totalChunks; i++) {
