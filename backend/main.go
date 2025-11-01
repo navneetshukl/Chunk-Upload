@@ -1,14 +1,4 @@
 // server.go
-// Simple chunk receiver that matches the frontend that sends FormData:
-// - chunk        : file part (binary)
-// - index        : chunk index (0-based)
-// - totalChunks  : total number of chunks
-// - fileName     : original file name
-//
-// Behavior:
-//  - writes chunks sequentially by appending to uploads/<fileName>.part
-//  - if index==0 it truncates any existing .part file (start fresh)
-//  - when index == totalChunks-1 it renames .part -> final file
 package main
 
 import (
@@ -23,10 +13,16 @@ import (
 	"sync"
 )
 
-const UploadDir = "./uploads"
-const MaxMemory = 32 << 20 // 32 MB for parsing multipart form headers
+const (
+	UploadDir     = "./uploads"
+	MaxMemory     = 32 << 20 // 32 MB for multipart parsing
+	Port          = ":8080"
+	AllowedOrigin = "http://localhost:5173"
+)
 
-// simple per-file lock to avoid concurrent writes
+// ---------------------------------------------------------------------
+// Per-file mutex map (prevents race conditions on the same file name)
+// ---------------------------------------------------------------------
 var fileLocks = struct {
 	sync.Mutex
 	m map[string]*sync.Mutex
@@ -43,143 +39,201 @@ func getLock(name string) *sync.Mutex {
 	return l
 }
 
+// ---------------------------------------------------------------------
+// Directory helper
+// ---------------------------------------------------------------------
 func ensureUploadDir() error {
-	return os.MkdirAll(UploadDir, 0o755)
+	err := os.MkdirAll(UploadDir, 0o755)
+	if err != nil {
+		log.Printf("ERROR: cannot create upload directory: %v", err)
+	}
+	return err
 }
 
-type jsonResp map[string]interface{}
+// ---------------------------------------------------------------------
+// JSON response structs
+// ---------------------------------------------------------------------
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
 
+type SuccessResponse struct {
+	Status   string `json:"status"`
+	Received int64  `json:"received,omitempty"`
+	Done     bool   `json:"done,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Note     string `json:"note,omitempty"`
+}
+
+// ---------------------------------------------------------------------
+// JSON helpers
+// ---------------------------------------------------------------------
+func respondJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("ERROR: JSON encode failed: %v", err)
+	}
+}
+
+func respondError(w http.ResponseWriter, code int, msg string, args ...interface{}) {
+	if len(args) > 0 {
+		msg = fmt.Sprintf(msg, args...)
+	}
+	log.Printf("HTTP %d | ERROR: %s", code, msg)
+	respondJSON(w, code, ErrorResponse{Error: msg})
+}
+
+func respondSuccess(w http.ResponseWriter, data SuccessResponse) {
+	log.Printf("HTTP 200 | SUCCESS: received=%d bytes | done=%v", data.Received, data.Done)
+	respondJSON(w, http.StatusOK, data)
+}
+
+// ---------------------------------------------------------------------
+// Main handler
+// ---------------------------------------------------------------------
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	// ----- CORS -----
+	w.Header().Set("Access-Control-Allow-Origin", AllowedOrigin)
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
+		respondError(w, http.StatusMethodNotAllowed, "only POST allowed")
 		return
 	}
 
+	// ----- Init upload dir -----
 	if err := ensureUploadDir(); err != nil {
-		http.Error(w, "cannot create upload dir", http.StatusInternalServerError)
+		respondError(w, http.StatusInternalServerError, "cannot initialise upload directory")
 		return
 	}
 
-	// parse multipart form
+	// ----- Parse multipart -----
 	if err := r.ParseMultipartForm(MaxMemory); err != nil {
-		http.Error(w, "invalid multipart form: "+err.Error(), http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "multipart parse error: %v", err)
 		return
 	}
 
-	// read form values
+	// ----- Form fields -----
 	indexStr := r.FormValue("index")
 	totalStr := r.FormValue("totalChunks")
 	fileName := r.FormValue("fileName")
 
+	fmt.Println("IndexStr ",indexStr)
+	fmt.Println("TotalStr ",totalStr)
+	fmt.Println("Filename ",fileName)
+
 	if indexStr == "" || totalStr == "" || fileName == "" {
-		http.Error(w, "missing index/totalChunks/fileName", http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "missing index, totalChunks or fileName")
 		return
 	}
 
 	index, err := strconv.Atoi(indexStr)
 	if err != nil || index < 0 {
-		http.Error(w, "invalid index", http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "invalid index")
 		return
 	}
 	totalChunks, err := strconv.Atoi(totalStr)
 	if err != nil || totalChunks <= 0 {
-		http.Error(w, "invalid totalChunks", http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "invalid totalChunks")
+		return
+	}
+	if index >= totalChunks {
+		respondError(w, http.StatusBadRequest, "index >= totalChunks")
 		return
 	}
 
-	// get the chunk file
-	file, _, err := r.FormFile("chunk")
+	// ----- Chunk file -----
+	chunkFile, header, err := r.FormFile("chunk")
 	if err != nil {
-		http.Error(w, "missing chunk file: "+err.Error(), http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "missing chunk: %v", err)
 		return
 	}
-	defer file.Close()
+	defer chunkFile.Close()
 
-	// per-file locking
+	chunkSize := header.Size
+	log.Printf("Chunk received | idx=%d/%d | size=%d | name=%s", index+1, totalChunks, chunkSize, fileName)
+
+	// ----- Per-file lock -----
 	lock := getLock(fileName)
 	lock.Lock()
 	defer lock.Unlock()
 
 	partPath := filepath.Join(UploadDir, fileName+".part")
+	finalPath := filepath.Join(UploadDir, fileName)
 
-	// If it's the first chunk, truncate/create the .part file
+	// ----- Open part file (truncate on first chunk) -----
+	var f *os.File
 	if index == 0 {
-		// Truncate or create
-		f, err := os.OpenFile(partPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-		if err != nil {
-			http.Error(w, "cannot create part file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// write chunk to file
-		written, err := io.Copy(f, file)
-		_ = f.Close()
-		if err != nil {
-			http.Error(w, "write error: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		log.Printf("wrote chunk index=%d (%d bytes) to %s", index, written, partPath)
+		f, err = os.OpenFile(partPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	} else {
-		// Append to existing .part file
-		f, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			http.Error(w, "cannot open part file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		written, err := io.Copy(f, file)
-		_ = f.Close()
-		if err != nil {
-			http.Error(w, "append error: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		log.Printf("appended chunk index=%d (%d bytes) to %s", index, written, partPath)
+		f, err = os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	}
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "cannot open part file: %v", err)
+		return
+	}
+	defer f.Close()
 
-	// If last chunk, rename to final file name
+	// ----- **FIXED** copy: destination = file, source = chunkFile -----
+	written, err := io.Copy(f, chunkFile) // <-- correct signature
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "write error: %v", err)
+		return
+	}
+	if written != chunkSize {
+		respondError(w, http.StatusInternalServerError,
+			"incomplete write: expected %d, wrote %d", chunkSize, written)
+		return
+	}
+	log.Printf("Wrote chunk %d (%d bytes) -> %s", index, written, partPath)
+
+	// ----- Final chunk? -----
 	if index == totalChunks-1 {
-		finalPath := filepath.Join(UploadDir, fileName)
 		if err := os.Rename(partPath, finalPath); err != nil {
-			// if rename fails, still return success but log error
-			log.Printf("rename error: %v", err)
-			respondJSON(w, http.StatusOK, jsonResp{
-				"status": "ok",
-				"note":   fmt.Sprintf("received last chunk but rename failed: %v", err),
+			log.Printf("WARN: rename failed %s -> %s: %v", partPath, finalPath, err)
+			respondSuccess(w, SuccessResponse{
+				Status: "ok",
+				Done:   true,
+				Path:   finalPath,
+				Note:   fmt.Sprintf("rename failed: %v", err),
 			})
 			return
 		}
-		log.Printf("upload complete: %s", finalPath)
-		respondJSON(w, http.StatusOK, jsonResp{
-			"status": "ok",
-			"done":   true,
-			"path":   finalPath,
+		log.Printf("Upload finished: %s (%d chunks)", finalPath, totalChunks)
+		respondSuccess(w, SuccessResponse{
+			Status: "ok",
+			Done:   true,
+			Path:   finalPath,
 		})
 		return
 	}
 
-	// Not last chunk
-	// report current size
+	// ----- Intermediate progress -----
 	fi, err := os.Stat(partPath)
-	received := int64(0)
-	if err == nil {
-		received = fi.Size()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "stat error after write: %v", err)
+		return
 	}
-	respondJSON(w, http.StatusOK, jsonResp{
-		"status":   "ok",
-		"received": received,
+	respondSuccess(w, SuccessResponse{
+		Status:   "ok",
+		Received: fi.Size(),
 	})
 }
 
-func respondJSON(w http.ResponseWriter, code int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
+// ---------------------------------------------------------------------
+// Server entry point
+// ---------------------------------------------------------------------
 func main() {
 	if err := ensureUploadDir(); err != nil {
-		log.Fatalf("cannot create upload dir: %v", err)
+		log.Fatalf("FATAL: upload dir: %v", err)
 	}
 	http.HandleFunc("/upload", uploadHandler)
-	addr := ":8080"
-	log.Printf("listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	log.Printf("Server listening on %s | origin=%s", Port, AllowedOrigin)
+	log.Fatal(http.ListenAndServe(Port, nil))
 }
