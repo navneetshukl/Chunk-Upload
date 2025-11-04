@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend   
+    container_name: backend-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./uploads:/app/uploads 
