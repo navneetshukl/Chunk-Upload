@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chunk-upload-deployment
+  labels:
+    app: chunk-upload
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: chunk-upload
+  template:
+    metadata:
+      labels:
+        app: chunk-upload
+    spec:
+      containers:
+        - name: chunk-upload-container
+          image:
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ENV
+              value: "production"
+          volumeMounts:
+            - name: upload-data
+              mountPath: /app/uploads
+      volumes:
+        - name: upload-data
+          persistentVolumeClaim:
+            claimName: chunk-upload-pvc
+  

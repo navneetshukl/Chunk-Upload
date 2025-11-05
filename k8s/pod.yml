@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: chunk-upload-pod
+  labels:
+    app: chunk-upload
+spec:
+  containers:
+    - name: chunk-upload-container
+      image:
+      ports:
+        - containerPort: 8080
+      env:
+        - name: ENV
+          value: "production"
+      volumeMounts:
+        - name: upload-data
+          mountPath: /app/uploads
+
+volumes:
+  - name: upload-data
+    persistentVolumeClaim:
+      claimName:  chunk-upload-pvc
