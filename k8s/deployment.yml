@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: chunk-upload-container
-          image:
+          image: navneetshukla/chunk-upload:latest
           ports:
             - containerPort: 8080
           env:
@@ -28,5 +28,5 @@ spec:
       volumes:
         - name: upload-data
           persistentVolumeClaim:
-            claimName: chunk-upload-pvc
+            claimName: chunk-uploads-pvc
   

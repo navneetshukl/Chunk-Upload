@@ -49,7 +49,7 @@ const UploadComponent = () => {
     try {
       await uploadFileInChunks(
         file,
-        "http://localhost:8080/upload",
+        "http://127.0.0.1:49869/upload",
         (current, total) => {
           const percent = Math.round((current / total) * 100);
           setProgress(percent);
